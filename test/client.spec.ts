@@ -1,21 +1,22 @@
-import { readFileSync } from "fs";
-import { join } from "path";
-import { deepEqual, equal, ok } from "assert";
-import { URL } from "url";
-import Client, { OAuth } from "../lib/client";
-import * as Types from "../lib/types";
-import { getStreamData } from "./helpers/stream";
-import * as nock from "nock";
+import { readFileSync } from "node:fs";
+import { Buffer } from "node:buffer";
+import { join } from "node:path";
+import { deepEqual, equal, ok, strictEqual } from "node:assert";
+import { URL } from "node:url";
+import Client, { OAuth } from "../lib/client.js";
+import * as Types from "../lib/types.js";
+import { getStreamData } from "./helpers/stream.js";
+import { http, HttpResponse } from "msw";
+import { setupServer } from "msw/node";
 import {
+  DATA_API_PREFIX,
   MESSAGING_API_PREFIX,
   OAUTH_BASE_PREFIX,
   OAUTH_BASE_PREFIX_V2_1,
-  DATA_API_PREFIX,
-} from "../lib/endpoints";
-import * as FormData from "form-data";
-import { createMultipartFormData } from "../lib/utils";
+} from "../lib/endpoints.js";
 
-const pkg = require("../package.json");
+import { describe, it, beforeAll, afterAll, afterEach } from "vitest";
+import { parseForm } from "./helpers/parse-form";
 
 const channelAccessToken = "test_channel_access_token";
 
@@ -23,36 +24,51 @@ const client = new Client({
   channelAccessToken,
 });
 
-const responseFn = function (
-  this: nock.ReplyFnContext,
-  uri: string,
-  _body: nock.Body,
-  cb: (err: NodeJS.ErrnoException | null, result: nock.ReplyFnResult) => void,
-) {
-  const fullUrl =
-    // @ts-ignore
-    this.req.options.protocol +
-    "//" +
-    // @ts-ignore
-    this.req.options.hostname +
-    // @ts-ignore
-    this.req.options.path;
+class MSWResult {
+  private _done: boolean;
 
-  if (fullUrl.startsWith(MESSAGING_API_PREFIX + "/message/"))
-    cb(null, [
-      200,
-      {},
-      {
-        "X-Line-Request-Id": "X-Line-Request-Id",
-      },
-    ]);
-  else cb(null, [200, {}]);
+  constructor() {
+    this._done = false;
+  }
+
+  public done() {
+    this._done = true;
+  }
+
+  public isDone() {
+    return this._done;
+  }
+}
+
+function checkQuery(request: Request, expectedQuery: Record<string, string>) {
+  if (expectedQuery) {
+    const url = new URL(request.url);
+    const queryParams = url.searchParams;
+    for (const key in expectedQuery) {
+      equal(queryParams.get(key), expectedQuery[key]);
+    }
+  }
+}
+const checkInterceptionOption = (
+  request: Request,
+  interceptionOption: Record<string, string>,
+) => {
+  for (const key in interceptionOption) {
+    equal(request.headers.get(key), interceptionOption[key]);
+  }
 };
 
 describe("client", () => {
-  before(() => nock.disableNetConnect());
-  afterEach(() => nock.cleanAll());
-  after(() => nock.enableNetConnect());
+  const server = setupServer();
+  beforeAll(() => {
+    server.listen();
+  });
+  afterAll(() => {
+    server.close();
+  });
+  afterEach(() => {
+    server.resetHandlers();
+  });
 
   const testMsg: Types.TextMessage = { type: "text", text: "hello" };
   const richMenu: Types.RichMenu = {
@@ -79,67 +95,139 @@ describe("client", () => {
     ],
   };
 
-  const interceptionOption = {
-    reqheaders: {
-      authorization: `Bearer ${channelAccessToken}`,
-      "User-Agent": `${pkg.name}/${pkg.version}`,
-    },
+  const interceptionOption: Record<string, string> = {
+    authorization: `Bearer ${channelAccessToken}`,
+    "User-Agent": "@line/bot-sdk/__LINE_BOT_SDK_NODEJS_VERSION__",
   };
 
   const mockGet = (
     prefix: string,
     path: string,
-    expectedQuery?: boolean | string | nock.DataMatcherMap | URLSearchParams,
+    expectedQuery?: Record<string, string>,
   ) => {
-    let _it = nock(prefix, interceptionOption).get(path);
-    if (expectedQuery) {
-      _it = _it.query(expectedQuery);
-    }
-    return _it.reply(responseFn);
+    const result = new MSWResult();
+    server.use(
+      http.get(prefix + path, ({ request }) => {
+        checkInterceptionOption(request, interceptionOption);
+
+        checkQuery(request, expectedQuery);
+
+        result.done();
+
+        if (request.url.startsWith(MESSAGING_API_PREFIX + "/message/")) {
+          return HttpResponse.json({
+            "X-Line-Request-Id": "X-Line-Request-Id",
+          });
+        } else {
+          return HttpResponse.json({});
+        }
+      }),
+    );
+    return result;
   };
 
   const mockPost = (
     prefix: string,
     path: string,
-    expectedBody?: nock.RequestBodyMatcher,
+    expectedBody?: Record<string, any>,
   ) => {
-    return nock(prefix, interceptionOption)
-      .post(path, expectedBody)
-      .reply(responseFn);
+    const result = new MSWResult();
+    server.use(
+      http.post(prefix + path, async ({ request, params, cookies }) => {
+        for (const key in interceptionOption) {
+          equal(request.headers.get(key), interceptionOption[key]);
+        }
+
+        if (expectedBody) {
+          if (Buffer.isBuffer(expectedBody)) {
+            const body = await request.blob();
+            equal(body.size, expectedBody.length);
+            // TODO compare content
+          } else {
+            const dat = await request.json();
+            ok(dat);
+            deepEqual(dat, expectedBody);
+          }
+        }
+
+        result.done();
+
+        if (request.url.startsWith(MESSAGING_API_PREFIX + "/message/")) {
+          return HttpResponse.json({
+            "x-line-request-id": "X-Line-Request-Id",
+          });
+        } else {
+          return HttpResponse.json({});
+        }
+      }),
+    );
+    return result;
   };
 
-  const multipartFormDataMatcher = (expectedBody: Record<string, any>) => (
-    body: any,
+  const checkMultipartFormData = async (
+    request: Request,
+    expectedBody: Record<string, any>,
   ) => {
-    const decoded = Buffer.from(body, "hex");
-    const boundary = decoded.toString("utf-8").match(/^--(.+)/)[1];
-    const data = new FormData();
-    //@ts-ignore
-    data._boundary = boundary;
-    createMultipartFormData.call(data, expectedBody);
-    return data.getBuffer().compare(decoded) === 0;
+    const formData = await request.formData();
+    for (let expectedBodyKey in expectedBody) {
+      equal(formData.get(expectedBodyKey), expectedBody[expectedBodyKey]);
+    }
   };
 
-  const mockPut = (
-    prefix: string,
-    path: string,
-    expectedBody?: nock.RequestBodyMatcher,
-  ) => {
-    return nock(prefix, interceptionOption)
-      .put(path, expectedBody)
-      .reply(responseFn);
+  const mockPut = (prefix: string, path: string, expectedBody?: any) => {
+    const result = new MSWResult();
+    server.use(
+      http.put(prefix + path, async ({ request, params, cookies }) => {
+        for (const key in interceptionOption) {
+          equal(request.headers.get(key), interceptionOption[key]);
+        }
+
+        if (expectedBody) {
+          const dat = await request.json();
+          ok(dat);
+          deepEqual(dat, expectedBody);
+        }
+
+        result.done();
+
+        if (request.url.startsWith(MESSAGING_API_PREFIX + "/message/")) {
+          return HttpResponse.json({
+            "X-Line-Request-Id": "X-Line-Request-Id",
+          });
+        } else {
+          return HttpResponse.json({});
+        }
+      }),
+    );
+    return result;
   };
 
   const mockDelete = (
     prefix: string,
     path: string,
-    expectedQuery?: boolean | string | nock.DataMatcherMap | URLSearchParams,
+    expectedQuery?: Record<string, string>,
   ) => {
-    let _it = nock(prefix, interceptionOption).delete(path);
-    if (expectedQuery) {
-      _it = _it.query(expectedQuery);
-    }
-    return _it.reply(responseFn);
+    const result = new MSWResult();
+    server.use(
+      http.delete(prefix + path, async ({ request, params, cookies }) => {
+        for (const key in interceptionOption) {
+          equal(request.headers.get(key), interceptionOption[key]);
+        }
+
+        checkQuery(request, expectedQuery);
+
+        result.done();
+
+        if (request.url.startsWith(MESSAGING_API_PREFIX + "/message/")) {
+          return HttpResponse.json({
+            "X-Line-Request-Id": "X-Line-Request-Id",
+          });
+        } else {
+          return HttpResponse.json({});
+        }
+      }),
+    );
+    return result;
   };
 
   it("reply", async () => {
@@ -154,6 +242,16 @@ describe("client", () => {
     equal(res["x-line-request-id"], "X-Line-Request-Id");
   });
 
+  it("validateReplyMessageObjects", async () => {
+    const scope = mockPost(MESSAGING_API_PREFIX, `/message/validate/reply`, {
+      messages: [testMsg],
+    });
+
+    const res = await client.validateReplyMessageObjects(testMsg);
+    strictEqual(scope.isDone(), true);
+    strictEqual(res["x-line-request-id"], "X-Line-Request-Id");
+  });
+
   it("push", async () => {
     const scope = mockPost(MESSAGING_API_PREFIX, `/message/push`, {
       messages: [testMsg],
@@ -164,6 +262,16 @@ describe("client", () => {
     const res = await client.pushMessage("test_user_id", testMsg);
     equal(scope.isDone(), true);
     equal(res["x-line-request-id"], "X-Line-Request-Id");
+  });
+
+  it("validatePushMessageObjects", async () => {
+    const scope = mockPost(MESSAGING_API_PREFIX, `/message/validate/push`, {
+      messages: [testMsg],
+    });
+
+    const res = await client.validatePushMessageObjects(testMsg);
+    strictEqual(scope.isDone(), true);
+    strictEqual(res["x-line-request-id"], "X-Line-Request-Id");
   });
 
   it("multicast", async () => {
@@ -177,6 +285,23 @@ describe("client", () => {
     const res = await client.multicast(ids, [testMsg, testMsg]);
     equal(scope.isDone(), true);
     equal(res["x-line-request-id"], "X-Line-Request-Id");
+  });
+
+  it("validateMulticastMessageObjects", async () => {
+    const scope = mockPost(
+      MESSAGING_API_PREFIX,
+      `/message/validate/multicast`,
+      {
+        messages: [testMsg, testMsg],
+      },
+    );
+
+    const res = await client.validateMulticastMessageObjects([
+      testMsg,
+      testMsg,
+    ]);
+    strictEqual(scope.isDone(), true);
+    strictEqual(res["x-line-request-id"], "X-Line-Request-Id");
   });
 
   it("narrowcast", async () => {
@@ -268,6 +393,23 @@ describe("client", () => {
     equal(res["x-line-request-id"], "X-Line-Request-Id");
   });
 
+  it("validateNarrowcastMessageObjects", async () => {
+    const scope = mockPost(
+      MESSAGING_API_PREFIX,
+      `/message/validate/narrowcast`,
+      {
+        messages: [testMsg, testMsg],
+      },
+    );
+
+    const res = await client.validateNarrowcastMessageObjects([
+      testMsg,
+      testMsg,
+    ]);
+    strictEqual(scope.isDone(), true);
+    strictEqual(res["x-line-request-id"], "X-Line-Request-Id");
+  });
+
   it("broadcast", async () => {
     const scope = mockPost(MESSAGING_API_PREFIX, `/message/broadcast`, {
       messages: [testMsg, testMsg],
@@ -277,6 +419,62 @@ describe("client", () => {
     const res = await client.broadcast([testMsg, testMsg]);
     equal(scope.isDone(), true);
     equal(res["x-line-request-id"], "X-Line-Request-Id");
+  });
+
+  it("validateBroadcastMessageObjects", async () => {
+    const scope = mockPost(
+      MESSAGING_API_PREFIX,
+      `/message/validate/broadcast`,
+      {
+        messages: [testMsg, testMsg],
+      },
+    );
+
+    const res = await client.validateBroadcastMessageObjects([
+      testMsg,
+      testMsg,
+    ]);
+    strictEqual(scope.isDone(), true);
+    strictEqual(res["x-line-request-id"], "X-Line-Request-Id");
+  });
+
+  describe("validateCustomAggregationUnits", () => {
+    it("should validate correctly when input is valid", () => {
+      const units = ["promotion_A1"];
+      const result = client.validateCustomAggregationUnits(units);
+      strictEqual(result.valid, true);
+      strictEqual(result.messages.length, 0);
+    });
+
+    it("should return invalid when there is more than one unit", () => {
+      const units = ["promotion_A1", "promotion_A2"];
+      const result = client.validateCustomAggregationUnits(units);
+      strictEqual(result.valid, false);
+      strictEqual(
+        result.messages[0],
+        "customAggregationUnits can only contain one unit",
+      );
+    });
+
+    it("should return invalid when a unit has more than 30 characters", () => {
+      const units = ["promotion_A1_with_a_very_long_name"];
+      const result = client.validateCustomAggregationUnits(units);
+      strictEqual(result.valid, false);
+      strictEqual(
+        result.messages[0],
+        "customAggregationUnits[0] must be less than or equal to 30 characters",
+      );
+    });
+
+    it("should return invalid when a unit has invalid characters", () => {
+      const units = ["promotion_A1!"];
+      const result = client.validateCustomAggregationUnits(units);
+      strictEqual(result.valid, false);
+      strictEqual(
+        result.messages[0],
+        "customAggregationUnits[0] must be alphanumeric characters or underscores",
+      );
+    });
   });
 
   it("getProfile", async () => {
@@ -316,27 +514,39 @@ describe("client", () => {
   });
 
   const mockGroupMemberAPI = () => {
-    const matchReg = /([A-Za-z0-9_]+)\/([A-Za-z0-9_]+)\/members\/ids/;
+    const scope = new MSWResult();
+    server.use(
+      http.get(
+        MESSAGING_API_PREFIX + "/:groupOrRoom/:id/members/ids",
+        async ({ request }) => {
+          const urlParts = new URL(request.url).pathname.split("/");
+          const groupOrRoom = urlParts[urlParts.length - 4];
+          const id = urlParts[urlParts.length - 3];
+          console.log(
+            `url=${
+              new URL(request.url).pathname
+            } groupOrRoom: ${groupOrRoom}, id: ${id}`,
+          );
+          const start =
+            parseInt(new URL(request.url).searchParams.get("start"), 10) || 0;
 
-    return nock(MESSAGING_API_PREFIX, interceptionOption)
-      .get(matchReg)
-      .times(3)
-      .reply(200, (uri, _requestBody) => {
-        const _url = new URL(MESSAGING_API_PREFIX + uri);
-        let [_matchPath, groupOrRoom, id] = _url.pathname.match(matchReg);
+          const memberIds = [start, start + 1, start + 2].map(
+            i => `${groupOrRoom}-${id}-${i}`,
+          );
 
-        const ty: string = groupOrRoom;
-        const start: number = parseInt(_url.searchParams.get("start"), 10) || 0;
+          const result: { memberIds: string[]; next?: string } = { memberIds };
 
-        const result: { memberIds: string[]; next?: string } = {
-          memberIds: [start, start + 1, start + 2].map(i => `${ty}-${id}-${i}`),
-        };
+          if (start / 3 < 2) {
+            result.next = String(start + 3);
+          }
 
-        if (start / 3 < 2) {
-          result.next = String(start + 3);
-        }
-        return result;
-      });
+          scope.done();
+
+          return HttpResponse.json(result);
+        },
+      ),
+    );
+    return scope;
   };
 
   it("getGroupMemberIds", async () => {
@@ -373,6 +583,12 @@ describe("client", () => {
       "room-test_room_id-7",
       "room-test_room_id-8",
     ]);
+  });
+
+  it("getBotFollowersIds", async () => {
+    const scope = mockGet(MESSAGING_API_PREFIX, "/followers/ids?limit=1000");
+    const ids = await client.getBotFollowersIds();
+    equal(scope.isDone(), true);
   });
 
   it("getGroupMembersCount", async () => {
@@ -451,6 +667,60 @@ describe("client", () => {
       "/richmenu/test_rich_menu_id",
     );
     const res = await client.deleteRichMenu("test_rich_menu_id");
+    equal(scope.isDone(), true);
+    deepEqual(res, {});
+  });
+
+  it("getRichMenuAliasList", async () => {
+    const scope = mockGet(MESSAGING_API_PREFIX, "/richmenu/alias/list");
+    const res = await client.getRichMenuAliasList();
+    equal(scope.isDone(), true);
+    deepEqual(res, {});
+  });
+
+  it("getRichMenuAlias", async () => {
+    const richMenuAliasId = "test_rich_menu_alias_id";
+    const scope = mockGet(
+      MESSAGING_API_PREFIX,
+      `/richmenu/alias/${richMenuAliasId}`,
+    );
+    const res = await client.getRichMenuAlias(richMenuAliasId);
+    equal(scope.isDone(), true);
+    deepEqual(res, {});
+  });
+
+  it("createRichMenuAlias", async () => {
+    const richMenuId = "test_rich_menu_id";
+    const richMenuAliasId = "test_rich_menu_alias_id";
+    const scope = mockPost(MESSAGING_API_PREFIX, "/richmenu/alias", {
+      richMenuId,
+      richMenuAliasId,
+    });
+    await client.createRichMenuAlias(richMenuId, richMenuAliasId);
+
+    equal(scope.isDone(), true);
+  });
+
+  it("deleteRichMenuAlias", async () => {
+    const scope = mockDelete(
+      MESSAGING_API_PREFIX,
+      "/richmenu/alias/test_rich_menu_alias_id",
+    );
+    const res = await client.deleteRichMenuAlias("test_rich_menu_alias_id");
+    equal(scope.isDone(), true);
+    deepEqual(res, {});
+  });
+
+  it("updateRichMenuAlias", async () => {
+    const richMenuId = "test_rich_menu_id";
+    const richMenuAliasId = "test_rich_menu_alias_id";
+    const scope = mockPost(
+      MESSAGING_API_PREFIX,
+      "/richmenu/alias/test_rich_menu_alias_id",
+      { richMenuId },
+    );
+
+    const res = await client.updateRichMenuAlias(richMenuAliasId, richMenuId);
     equal(scope.isDone(), true);
     deepEqual(res, {});
   });
@@ -685,6 +955,24 @@ describe("client", () => {
     equal(scope.isDone(), true);
   });
 
+  it("getStatisticsPerUnit", async () => {
+    const customAggregationUnit = "promotion_a";
+    const from = "20210301";
+    const to = "20210331";
+    const scope = mockGet(
+      MESSAGING_API_PREFIX,
+      "/insight/message/event/aggregation",
+      {
+        customAggregationUnit,
+        from,
+        to,
+      },
+    );
+
+    await client.getStatisticsPerUnit(customAggregationUnit, from, to);
+    equal(scope.isDone(), true);
+  });
+
   it("createUploadAudienceGroup", async () => {
     const requestBody = {
       description: "audienceGroupName",
@@ -717,18 +1005,37 @@ describe("client", () => {
       file: buffer,
     };
 
-    const scope = nock(DATA_API_PREFIX, {
-      reqheaders: {
-        ...interceptionOption.reqheaders,
-        "content-type": value =>
-          value.startsWith(`multipart/form-data; boundary=`),
-      },
-    })
-      .post(
-        "/audienceGroup/upload/byFile",
-        multipartFormDataMatcher(requestBody),
-      )
-      .reply(responseFn);
+    const scope = new MSWResult();
+    server.use(
+      http.post(
+        DATA_API_PREFIX + "/audienceGroup/upload/byFile",
+        async ({ request }) => {
+          checkInterceptionOption(request, interceptionOption);
+          ok(
+            request.headers
+              .get("content-type")
+              .startsWith(`multipart/form-data; boundary=`),
+          );
+
+          const blob = await request.blob();
+          const arrayBuffer = await blob.arrayBuffer();
+          const formData = parseForm(arrayBuffer);
+          equal(formData["description"], requestBody.description);
+          equal(
+            formData["isIfaAudience"],
+            requestBody.isIfaAudience.toString(),
+          );
+          equal(formData["uploadDescription"], requestBody.uploadDescription);
+          equal(
+            Buffer.from(await (formData["file"] as Blob).arrayBuffer()),
+            requestBody.file.toString(),
+          );
+
+          scope.done();
+          return HttpResponse.json({});
+        },
+      ),
+    );
 
     await client.createUploadAudienceGroupByFile(requestBody);
     equal(scope.isDone(), true);
@@ -766,18 +1073,35 @@ describe("client", () => {
       uploadDescription: "fileName",
       file: buffer,
     };
-    const scope = nock(DATA_API_PREFIX, {
-      reqheaders: {
-        ...interceptionOption.reqheaders,
-        "content-type": value =>
-          value.startsWith(`multipart/form-data; boundary=`),
-      },
-    })
-      .put(
-        "/audienceGroup/upload/byFile",
-        multipartFormDataMatcher(requestBody),
-      )
-      .reply(responseFn);
+
+    const scope = new MSWResult();
+    server.use(
+      http.put(
+        DATA_API_PREFIX + "/audienceGroup/upload/byFile",
+        async ({ request }) => {
+          checkInterceptionOption(request, interceptionOption);
+          ok(
+            request.headers
+              .get("content-type")
+              .startsWith(`multipart/form-data; boundary=`),
+          );
+          const blob = await request.blob();
+          const arrayBuffer = await blob.arrayBuffer();
+          const formData = parseForm(arrayBuffer);
+          equal(formData["audienceGroupId"], requestBody.audienceGroupId);
+          equal(formData["uploadDescription"], requestBody.uploadDescription);
+          equal(
+            Buffer.from(
+              await (formData["file"] as Blob).arrayBuffer(),
+            ).toString(),
+            requestBody.file.toString(),
+          );
+          scope.done();
+
+          return HttpResponse.json({});
+        },
+      ),
+    );
 
     await client.updateUploadAudienceGroupByFile(requestBody);
     equal(scope.isDone(), true);
@@ -861,12 +1185,12 @@ describe("client", () => {
     const includesExternalPublicGroups = true;
 
     const scope = mockGet(MESSAGING_API_PREFIX, `/audienceGroup/list`, {
-      page,
+      page: page.toString(),
       description,
       status,
-      size,
+      size: size.toString(),
       createRoute,
-      includesExternalPublicGroups,
+      includesExternalPublicGroups: includesExternalPublicGroups.toString(),
     });
 
     await client.getAudienceGroups(
@@ -939,19 +1263,30 @@ describe("client", () => {
     };
     const retryKey = "retryKey";
 
-    const firstRequest = nock(MESSAGING_API_PREFIX, {
-      reqheaders: {
-        ...interceptionOption.reqheaders,
-        "X-Line-Retry-Key": retryKey,
-      },
-    })
-      .post(`/message/push`, expectedBody)
-      .reply(responseFn);
-    const secondRequest = mockPost(MESSAGING_API_PREFIX, `/message/push`, {
-      messages: [testMsg],
-      to: "test_user_id",
-      notificationDisabled: false,
-    });
+    const firstRequest = new MSWResult();
+    const secondRequest = new MSWResult();
+    server.use(
+      http.post(MESSAGING_API_PREFIX + "/message/push", async ({ request }) => {
+        checkInterceptionOption(request, interceptionOption);
+        if (request.headers.get("X-Line-Retry-Key") == retryKey) {
+          firstRequest.done();
+          deepEqual(await request.json(), expectedBody);
+          return HttpResponse.json({
+            "x-line-request-id": "X-Line-Request-Id",
+          });
+        } else {
+          secondRequest.done();
+          deepEqual(await request.json(), {
+            messages: [testMsg],
+            to: "test_user_id",
+            notificationDisabled: false,
+          });
+          return HttpResponse.json({
+            "x-line-request-id": "X-Line-Request-Id",
+          });
+        }
+      }),
+    );
 
     client.setRequestOptionOnce({
       retryKey,
@@ -994,21 +1329,36 @@ describe("client", () => {
     await client.getBotInfo();
     equal(scope.isDone(), true);
   });
+
+  it("validateRichMenu", async () => {
+    const scope = mockPost(
+      MESSAGING_API_PREFIX,
+      `/richmenu/validate`,
+      richMenu,
+    );
+
+    await client.validateRichMenu(richMenu);
+    equal(scope.isDone(), true);
+  });
 });
 
 const oauth = new OAuth();
 describe("oauth", () => {
-  before(() => nock.disableNetConnect());
-  afterEach(() => nock.cleanAll());
-  after(() => nock.enableNetConnect());
+  const server = setupServer();
+  beforeAll(() => {
+    server.listen();
+  });
+  afterAll(() => {
+    server.close();
+  });
+  afterEach(() => {
+    server.resetHandlers();
+  });
 
-  const interceptionOption = {
-    reqheaders: {
-      "content-type": "application/x-www-form-urlencoded",
-      "User-Agent": `${pkg.name}/${pkg.version}`,
-    },
+  const interceptionOption: Record<string, string> = {
+    "content-type": "application/x-www-form-urlencoded",
+    "User-Agent": "@line/bot-sdk/__LINE_BOT_SDK_NODEJS_VERSION__",
   };
-
   it("issueAccessToken", async () => {
     const client_id = "test_client_id";
     const client_secret = "test_client_secret";
@@ -1018,13 +1368,19 @@ describe("oauth", () => {
       token_type: "Bearer",
     };
 
-    const scope = nock(OAUTH_BASE_PREFIX, interceptionOption)
-      .post("/accessToken", {
-        grant_type: "client_credentials",
-        client_id,
-        client_secret,
-      })
-      .reply(200, reply);
+    const scope = new MSWResult();
+    server.use(
+      http.post(OAUTH_BASE_PREFIX + "/accessToken", async ({ request }) => {
+        const dat = new URLSearchParams(await request.text());
+        deepEqual(Object.fromEntries(dat.entries()), {
+          grant_type: "client_credentials",
+          client_id,
+          client_secret,
+        });
+        scope.done();
+        return HttpResponse.json(reply);
+      }),
+    );
 
     const res = await oauth.issueAccessToken(client_id, client_secret);
     equal(scope.isDone(), true);
@@ -1033,11 +1389,65 @@ describe("oauth", () => {
 
   it("revokeAccessToken", async () => {
     const access_token = "test_channel_access_token";
-    const scope = nock(OAUTH_BASE_PREFIX, interceptionOption)
-      .post("/revoke", { access_token })
-      .reply(200, {});
+
+    const scope = new MSWResult();
+    server.use(
+      http.post(OAUTH_BASE_PREFIX + "/revoke", async ({ request }) => {
+        checkInterceptionOption(request, interceptionOption);
+        const dat = new URLSearchParams(await request.text());
+        deepEqual(Object.fromEntries(dat.entries()), {
+          access_token,
+        });
+        scope.done();
+        return HttpResponse.json({});
+      }),
+    );
 
     const res = await oauth.revokeAccessToken(access_token);
+    equal(scope.isDone(), true);
+    deepEqual(res, {});
+  });
+
+  it("verifyAccessToken", async () => {
+    const access_token = "test_channel_access_token";
+    const scope = new MSWResult();
+    server.use(
+      http.get(OAUTH_BASE_PREFIX_V2_1 + "/verify", async ({ request }) => {
+        const query = new URL(request.url).searchParams;
+        equal(query.get("access_token"), access_token);
+        scope.done();
+        return HttpResponse.json({});
+      }),
+    );
+
+    const res = await oauth.verifyAccessToken(access_token);
+    equal(scope.isDone(), true);
+    deepEqual(res, {});
+  });
+
+  it("verifyIdToken", async () => {
+    const id_token = "test_channel_access_token";
+    const client_id = "test_client_id";
+    const nonce = "test_nonce";
+    const user_id = "test_user_id";
+
+    const scope = new MSWResult();
+    server.use(
+      http.post(OAUTH_BASE_PREFIX_V2_1 + "/verify", async ({ request }) => {
+        checkInterceptionOption(request, interceptionOption);
+        const dat = new URLSearchParams(await request.text());
+        deepEqual(Object.fromEntries(dat.entries()), {
+          id_token,
+          client_id,
+          nonce,
+          user_id,
+        });
+        scope.done();
+        return HttpResponse.json({});
+      }),
+    );
+
+    const res = await oauth.verifyIdToken(id_token, client_id, nonce, user_id);
     equal(scope.isDone(), true);
     deepEqual(res, {});
   });
@@ -1051,14 +1461,21 @@ describe("oauth", () => {
       key_id: "key_id",
     };
 
-    const scope = nock(OAUTH_BASE_PREFIX_V2_1, interceptionOption)
-      .post("/token", {
-        grant_type: "client_credentials",
-        client_assertion_type:
-          "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-        client_assertion,
-      })
-      .reply(200, reply);
+    const scope = new MSWResult();
+    server.use(
+      http.post(OAUTH_BASE_PREFIX_V2_1 + "/token", async ({ request }) => {
+        checkInterceptionOption(request, interceptionOption);
+        const dat = new URLSearchParams(await request.text());
+        deepEqual(Object.fromEntries(dat.entries()), {
+          grant_type: "client_credentials",
+          client_assertion_type:
+            "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+          client_assertion,
+        });
+        scope.done();
+        return HttpResponse.json(reply);
+      }),
+    );
 
     const res = await oauth.issueChannelAccessTokenV2_1(client_assertion);
     equal(scope.isDone(), true);
@@ -1071,14 +1488,21 @@ describe("oauth", () => {
       key_ids: ["key_id"],
     };
 
-    const scope = nock(OAUTH_BASE_PREFIX_V2_1)
-      .get("/tokens/kid")
-      .query({
-        client_assertion_type:
-          "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-        client_assertion,
-      })
-      .reply(200, reply);
+    const scope = new MSWResult();
+    server.use(
+      http.get(OAUTH_BASE_PREFIX_V2_1 + "/tokens/kid", async ({ request }) => {
+        const query = new URL(request.url).searchParams;
+        for (const [key, value] of Object.entries({
+          client_assertion_type:
+            "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+          client_assertion,
+        })) {
+          equal(query.get(key), value);
+        }
+        scope.done();
+        return HttpResponse.json(reply);
+      }),
+    );
 
     const res = await oauth.getChannelAccessTokenKeyIdsV2_1(client_assertion);
     equal(scope.isDone(), true);
@@ -1089,9 +1513,20 @@ describe("oauth", () => {
     const client_id = "test_client_id",
       client_secret = "test_client_secret",
       access_token = "test_channel_access_token";
-    const scope = nock(OAUTH_BASE_PREFIX_V2_1, interceptionOption)
-      .post("/revoke", { client_id, client_secret, access_token })
-      .reply(200, {});
+    const scope = new MSWResult();
+    server.use(
+      http.post(OAUTH_BASE_PREFIX_V2_1 + "/revoke", async ({ request }) => {
+        checkInterceptionOption(request, interceptionOption);
+
+        const params = new URLSearchParams(await request.text());
+        ok(params);
+        equal(params.get("client_id"), client_id);
+        equal(params.get("client_secret"), client_secret);
+        equal(params.get("access_token"), access_token);
+        scope.done();
+        return HttpResponse.json({});
+      }),
+    );
 
     const res = await oauth.revokeChannelAccessTokenV2_1(
       client_id,

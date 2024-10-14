@@ -1,15 +1,16 @@
 import * as bodyParser from "body-parser";
-import * as express from "express";
-import { Server } from "http";
-import { join } from "path";
-import { writeFileSync } from "fs";
+import { Buffer } from "node:buffer";
+import express from "express";
+import { Server } from "node:http";
+import { join } from "node:path";
+import { writeFileSync } from "node:fs";
 import {
   JSONParseError,
   SignatureValidationFailed,
-} from "../../lib/exceptions";
+} from "../../lib/exceptions.js";
 import * as finalhandler from "finalhandler";
 
-let server: Server = null;
+let server: Server | null = null;
 
 function listen(port: number, middleware?: express.RequestHandler) {
   const app = express();
@@ -76,16 +77,17 @@ function listen(port: number, middleware?: express.RequestHandler) {
   );
 
   return new Promise(resolve => {
-    server = app.listen(port, () => resolve());
+    server = app.listen(port, () => resolve(undefined));
   });
 }
 
 function close() {
   return new Promise(resolve => {
     if (!server) {
-      resolve();
+      return resolve(undefined);
     }
-    server.close(() => resolve());
+
+    server.close(() => resolve(undefined));
   });
 }
 

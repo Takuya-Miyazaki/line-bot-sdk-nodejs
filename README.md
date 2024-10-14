@@ -1,6 +1,6 @@
 # LINE Messaging API SDK for nodejs
 
-[![Travis CI](https://travis-ci.org/line/line-bot-sdk-nodejs.svg?branch=master)](https://travis-ci.org/line/line-bot-sdk-nodejs)
+[![Github Action](https://github.com/line/line-bot-sdk-nodejs/actions/workflows/test.yml/badge.svg)](https://github.com/line/line-bot-sdk-nodejs/actions/workflows/test.yml)
 [![npmjs](https://badge.fury.io/js/%40line%2Fbot-sdk.svg)](https://www.npmjs.com/package/@line/bot-sdk)
 
 
@@ -18,7 +18,7 @@ line-bot-sdk-nodejs documentation: https://line.github.io/line-bot-sdk-nodejs/#g
 
 ## Requirements
 
-* **Node.js** 10 or higher
+* **Node.js** 18 or higher
 
 ## Installation
 
@@ -31,11 +31,7 @@ $ npm install @line/bot-sdk --save
 ## Help and media
 FAQ: https://developers.line.biz/en/faq/
 
-Community Q&A: https://www.line-community.me/questions
-
 News: https://developers.line.biz/en/news/
-
-Twitter: @LINE_DEV 
 
 ## Versioning
 This project respects semantic versioning

@@ -15,16 +15,15 @@ of the official document.
 **Signature validation** is checking if a request is actually sent from real
 LINE servers, not a fraud. The validation is conducted by checking
 the [X-Line-Signature](https://developers.line.biz/en/reference/messaging-api/#signature-validation) header
-and request body. There is a [`validateSignature()`](../api-reference/validate-signature.md)
+and request body. There is a [`validateSignature()`](../apidocs/globals.html#validatesignature)
 function to do this.
 
 **Webhook event object parsing** is literally parsing webhook event objects,
 which contains information of each webhook event. The objects are provided as
-request body in JSON format, so any body parser will work here. For interal
-object types in this SDK, please refer to [Message and event objects](../api-reference/message-and-event-objects.md).
+request body in JSON format, so any body parser will work here.
 
 There is a function to generate a [connect](https://github.com/senchalabs/connect) middleware,
-[`middleware()`](../api-reference/middleware.md), to conduct both of them. If
+[`middleware()`](https://github.com/line/line-bot-sdk-nodejs/blob/master/lib/middleware.ts), to conduct both of them. If
 your server can make use of connect middlewares, such as [Express](https://expressjs.com/),
 using the middleware is a recommended way to build a webhook server.
 
@@ -39,44 +38,30 @@ We skip the detailed guide for Express.  If more information is needed about
 Express, please refer to its documentation.
 
 Here is an example of an HTTP server built with Express.
-
-``` js
-const express = require('express')
-
-const app = express()
-
-app.post('/webhook', (req, res) => {
-  res.json({})
-})
-
-app.listen(8080)
-```
-
 The server above listens to 8080 and will response with an empty object for
 `POST /webhook`. We will add webhook functionality to this server.
 
 ``` js
-const express = require('express')
-const middleware = require('@line/bot-sdk').middleware
+import express from 'express'
+import { middleware } from '@line/bot-sdk'
 
 const app = express()
 
 const config = {
-  channelAccessToken: 'YOUR_CHANNEL_ACCESS_TOKEN',
   channelSecret: 'YOUR_CHANNEL_SECRET'
 }
 
 app.post('/webhook', middleware(config), (req, res) => {
-  req.body.events // webhook event objects
-  req.body.destination // user ID of the bot (optional)
+  req.body.events // webhook event objects from LINE Platform
+  req.body.destination // user ID of the bot
   ...
 })
 
 app.listen(8080)
 ```
 
-We have imported `middleware` from the package and make the Express app to use
-the middleware. The middlware validates the request and parses webhook event
+We have imported `middleware` from `@line/bot-sdk` and make the Express app to use
+the middleware. The middleware validates the request and parses webhook event
 object. It embeds body-parser and parses them to objects. If you have a reason
 to use another body-parser separately for other routes, please keep in mind the
 followings.
@@ -115,7 +100,7 @@ However, there are environments where `req.body` is pre-parsed, such as
 [Firebase Cloud Functions](https://firebase.google.com/docs/functions/http-events).
 If it parses the body into string or buffer, the middleware will use the body
 as it is and work just fine. If the pre-parsed body is an object, the webhook
-middleware will fail to work. In the case, please use [`validateSignature()`](../api-reference/validate-signature.md)
+middleware will fail to work. In the case, please use [`validateSignature()`](../apidocs/globals.html#validatesignature)
 manually with raw body.
 
 ## Error handling
@@ -127,20 +112,17 @@ and the other is `JSONParseError`.
 - `SignatureValidationFailed` is thrown when a request has a wrong signature.
 - `JSONParseError` occurs when a request body cannot be parsed as JSON.
 
-For type references of the errors, please refer to [the API reference](../api-reference/exceptions.md).
+For type references of the errors, please refer to [the API reference](../apidocs/globals.md).
 
 The errors can be handled with [error middleware](https://github.com/senchalabs/connect#error-middleware).
 
 ``` js
-const express = require('express')
-const middleware = require('@line/bot-sdk').middleware
-const JSONParseError = require('@line/bot-sdk').JSONParseError
-const SignatureValidationFailed = require('@line/bot-sdk').SignatureValidationFailed
+import express from 'express'
+import {middleware, JSONParseError, SignatureValidationFailed} from '@line/bot-sdk'
 
 const app = express()
 
 const config = {
-  channelAccessToken: 'YOUR_CHANNEL_ACCESS_TOKEN',
   channelSecret: 'YOUR_CHANNEL_SECRET'
 }
 
@@ -163,6 +145,8 @@ app.use((err, req, res, next) => {
 
 app.listen(8080)
 ```
+
+You can read other examples in [lien-bot-sdk-nodejs/examples](https://github.com/line/line-bot-sdk-nodejs/tree/master/examples)
 
 ## HTTPS
 

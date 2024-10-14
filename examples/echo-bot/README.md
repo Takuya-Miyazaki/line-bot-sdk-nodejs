@@ -1,12 +1,13 @@
-# Echo Bot
+# Echo Bot (CommonJS)
 
-An example LINE bot just to echo messages
+An example LINE bot just to echo messages written in CommonJS.
 
 ## How to use
 
 ### Install deps
 
 ``` shell
+$ npm build-sdk
 $ npm install
 ```
 

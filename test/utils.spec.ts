@@ -1,6 +1,8 @@
-import { ensureJSON } from "../lib/utils";
-import { JSONParseError } from "../lib/exceptions";
-import { equal, ok } from "assert";
+import { ensureJSON } from "../lib/utils.js";
+import { JSONParseError } from "../lib/exceptions.js";
+import { equal, ok } from "node:assert";
+
+import { describe, it } from "vitest";
 
 describe("utils", () => {
   describe("ensureJSON", () => {

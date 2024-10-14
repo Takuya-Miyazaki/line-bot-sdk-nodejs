@@ -1,18 +1,39 @@
 name: Release Node.js Package
 on:
   release:
-    types: [created]
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'The version to release'
+        required: true
+
 jobs:
-  build:
+  release-package:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
     # Setup .npmrc file to publish to GitHub Packages
-    - uses: actions/setup-node@v1
+    - uses: actions/setup-node@v4
       with:
-        node-version: 14
+        node-version: 18
         registry-url: 'https://registry.npmjs.org'
     - run: npm install
+    - name: Update version in package.json, package-lock.json, and lib/version.ts
+      run: |
+        if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          VERSION=${{ github.event.inputs.version }}
+        else
+          VERSION=${{ github.event.release.tag_name }}
+        fi
+        VERSION=${VERSION#v}
+        sed -i "s/__LINE_BOT_SDK_NODEJS_VERSION__/$VERSION/g" package.json
+        sed -i "s/__LINE_BOT_SDK_NODEJS_VERSION__/$VERSION/g" package-lock.json
+        sed -i "s/__LINE_BOT_SDK_NODEJS_VERSION__/$VERSION/g" lib/version.ts
     - run: npm run release
       env:
         NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  deploy-docs:
+    needs: [release-package]
+    uses: ./.github/workflows/deploy-doc.yml
